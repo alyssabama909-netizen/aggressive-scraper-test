@@ -120,3 +120,31 @@ async function main() {
 }
 
 main();
+name: Run Aggressive Scraper Test
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Run scraper
+      run: npm start
+      env:
+        TARGET_URL: ${{ secrets.TARGET_URL }}  # Optional: Set as repo secret for security
+
+
+        
