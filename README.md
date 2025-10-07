@@ -1,9 +1,14 @@
-# My Node.js Scraper
+# Aggressive Scraper Test (staging use)
 
-This project is a Node.js web scraper that collects public data from safe, open websites (for testing and learning).
+Node scraper that crawls **same-origin** links up to a depth, extracts **emails & phones**, writes to `output/results.json`.
 
-## How to run locally
-1. Install Node.js (v20 or later)
-2. Install dependencies:
-   ```bash
-   npm install
+## Env Vars
+- `TARGET_URL` (required for real runs) — staging origin to crawl
+- `MAX_DEPTH` (default 3)
+- `MAX_PAGES_PER_LEVEL` (default 20)
+- `PROXIES` (optional) — comma-separated list, e.g. `http://user:pass@host:port,https://host:port`
+
+## Run locally
+```bash
+npm install
+TARGET_URL="https://your-staging-site.com" npm start
