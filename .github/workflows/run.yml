@@ -1,0 +1,47 @@
+name: Run scraper (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Start URL (required)"
+        required: true
+        default: "https://httpbin.org/html"
+      max_depth:
+        description: "Depth (default 3)"
+        required: false
+        default: "3"
+      max_per_level:
+        description: "Pages/level (default 20)"
+        required: false
+        default: "20"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci || npm install
+
+      - name: Run scraper
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          MAX_DEPTH: ${{ github.event.inputs.max_depth }}
+          MAX_PAGES_PER_LEVEL: ${{ github.event.inputs.max_per_level }}
+          PROXIES: ${{ secrets.PROXIES }}   # optional
+        run: |
+          mkdir -p output
+          npm start | tee output/log.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-output
+          path: output/
