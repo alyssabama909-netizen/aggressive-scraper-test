@@ -1,107 +1,149 @@
+// index.js
+// Safe, staging-only crawler: extracts emails & phone numbers and writes results.json
+// Reads TARGET_URL, PROXIES, MAX_DEPTH, MAX_PAGES_PER_LEVEL from environment (or uses defaults)
+
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const fakeUa = require('fake-useragent');
-const HttpsProxyAgent = require('https-proxy-agent');
 const fs = require('fs');
+const { URL } = require('url');
 
-const TARGET_URL = 'https://your-staging-site.com'; // Change to your test environment
-const MAX_DEPTH = 3;
-const MAX_PAGES_PER_LEVEL = 20;
-const PROXIES = [
-  'http://proxy1.example.com:port',
-  'http://proxy2.example.com:port',
-];
+// ---------- Config (env overrides recommended) ----------
+const TARGET_URL = process.env.TARGET_URL || 'https://example.com'; // <- put your staging URL here or via Secrets
+const MAX_DEPTH = Number(process.env.MAX_DEPTH || 3);
+const MAX_PAGES_PER_LEVEL = Number(process.env.MAX_PAGES_PER_LEVEL || 20);
+// PROXIES as comma-separated list: http://user:pass@host:port,https://host:port
+const PROXIES = (process.env.PROXIES || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// ---------- Regex (de-duped later) ----------
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-const PHONE_REGEX = /(\+?\d{1,3}[-.\s]?)?(`\(?\d{3}\)`?[-.\s]?)\d{3}[-.\s]?\d{4}/g;
+// Fixed phone regex (US/Intl-ish; no stray backticks)
+const PHONE_REGEX = /(\+?\d{1,3}[-.\s]?)?(\(?\d{2,4}\)?[-.\s]?)\d{3,4}[-.\s]?\d{4}/g;
 
-function getRandomConfig() {
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function getAxiosConfig(forUrl) {
   const ua = fakeUa();
-  const proxy = PROXIES[Math.floor(Math.random() * PROXIES.length)];
-  const agent = new HttpsProxyAgent(proxy);
-  return {
+  const cfg = {
     headers: {
       'User-Agent': ua,
-      'Referer': 'https://google.com',
-      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.google.com/',
+      'Accept-Language': 'en-US,en;q=0.9'
     },
-    httpsAgent: agent,
-    timeout: 5000,
+    timeout: 10000,
+    // axios follows redirects by default
+    maxRedirects: 5,
+    // make relative to target origin
+    validateStatus: s => s >= 200 && s < 400
   };
+
+  if (PROXIES.length) {
+    const proxy = pick(PROXIES);
+    // Only attach proxy agent for https URLs (most targets)
+    if (forUrl.startsWith('https://')) {
+      cfg.httpsAgent = new HttpsProxyAgent(proxy);
+    }
+  }
+  return cfg;
 }
 
 function extractContactInfo(html) {
-  const emails = html.match(EMAIL_REGEX) || [];
-  const phones = html.match(PHONE_REGEX) || [];
-  return { emails: [...new Set(emails)], phones: [...new Set(phones)] };
+  const emails = new Set((html.match(EMAIL_REGEX) || []).map(s => s.trim()));
+  const phones = new Set((html.match(PHONE_REGEX) || []).map(s => s.trim()));
+  return { emails: [...emails], phones: [...phones] };
 }
 
-async function aggressiveScrape(urls, depth) {
-  if (depth <= 0) return [];
-
-  console.log(`Scraping level ${MAX_DEPTH - depth + 1} with ${urls.length} URLs`);
-
-  const responses = await Promise.all(
-    urls.map(async (url) => {
-      try {
-        const config = getRandomConfig();
-        const response = await axios.get(url, config);
-        return { url, data: response.data };
-      } catch (error) {
-        console.error(`Failed to scrape ${url}: ${error.message}. Retrying once...`);
-        try {
-          const config = getRandomConfig();
-          const response = await axios.get(url, config);
-          return { url, data: response.data };
-        } catch (retryError) {
-          console.error(`Retry failed for ${url}: ${retryError.message}`);
-          return null;
-        }
-      }
-    })
-  );
-
-  const newUrls = [];
-  const scrapedData = [];
-  responses.forEach((res) => {
-    if (res) {
-      const $ = cheerio.load(res.data);
-      const fullText = $('body').text();
-      const contactInfo = extractContactInfo(fullText);
-
-      scrapedData.push({
-        url: res.url,
-        title: $('title').text(),
-        content: fullText.substring(0, 200) + '...',
-        emails: contactInfo.emails,
-        phones: contactInfo.phones,
-      });
-
-      $('a[href]').each((i, link) => {
-        const href = $(link).attr('href');
-        if (href && href.startsWith('/') && newUrls.length < MAX_PAGES_PER_LEVEL) {
-          newUrls.push(new URL(href, TARGET_URL).href);
-        }
-      });
-    }
-  });
-
-  console.log(`Extracted data from ${scrapedData.length} pages, including ${scrapedData.reduce((acc, item) => acc + item.emails.length + item.phones.length, 0)} contacts`);
-
-  const deeperData = await aggressiveScrape(newUrls, depth - 1);
-  return [...scrapedData, ...deeperData];
-}
-
-async function main() {
+function sameOrigin(href, base) {
   try {
-    const initialUrls = [TARGET_URL];
-    const allData = await aggressiveScrape(initialUrls, MAX_DEPTH);
-    console.log('Scraping complete. Sample data:', allData.slice(0, 5));
-    fs.writeFileSync('results.json', JSON.stringify(allData, null, 2));
-    console.log('Results saved to results.json');
-  } catch (error) {
-    console.error('Fatal error:', error);
+    const u = new URL(href, base);
+    const b = new URL(base);
+    return u.origin === b.origin;
+  } catch { return false; }
+}
+
+async function fetchPage(url) {
+  try {
+    const res = await axios.get(url, getAxiosConfig(url));
+    return res.data;
+  } catch (e) {
+    // One retry with a new UA/proxy
+    try {
+      const res = await axios.get(url, getAxiosConfig(url));
+      return res.data;
+    } catch (e2) {
+      console.error(`✖ ${url} -> ${e2.message}`);
+      return null;
+    }
   }
 }
 
-main();
+async function crawl(startUrl, maxDepth, perLevelLimit) {
+  const visited = new Set();
+  const queueByDepth = [[startUrl]];
+  const results = [];
+
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const batch = queueByDepth[depth] || [];
+    if (!batch.length) break;
+
+    console.log(`\n▶ Depth ${depth + 1}/${maxDepth} — ${batch.length} URL(s)`);
+    const nextLevel = [];
+
+    // Limit pages per level for safety
+    const slice = batch.slice(0, perLevelLimit);
+
+    await Promise.all(slice.map(async (url) => {
+      if (visited.has(url)) return;
+      visited.add(url);
+
+      const html = await fetchPage(url);
+      if (!html) return;
+
+      const $ = cheerio.load(html);
+      const text = $('body').text() || '';
+      const contact = extractContactInfo(text);
+
+      results.push({
+        url,
+        title: ($('title').text() || '').trim(),
+        preview: text.slice(0, 200).replace(/\s+/g, ' ') + (text.length > 200 ? '…' : ''),
+        emails: contact.emails,
+        phones: contact.phones
+      });
+
+      // Discover links on same origin
+      $('a[href]').each((_, a) => {
+        const href = $(a).attr('href');
+        if (!href) return;
+        try {
+          const abs = new URL(href, url).toString();
+          if (sameOrigin(abs, startUrl) && !visited.has(abs)) {
+            nextLevel.push(abs);
+          }
+        } catch { /* ignore bad URLs */ }
+      });
+    }));
+
+    console.log(`✓ Collected ${results.length} page(s) so far`);
+
+    if (nextLevel.length) {
+      queueByDepth[depth + 1] = nextLevel;
+    }
+  }
+
+  return results;
+}
+
+(async function main() {
+  try {
+    console.log(`Starting crawl: ${TARGET_URL}`);
+    const data = await crawl(TARGET_URL, MAX_DEPTH, MAX_PAGES_PER_LEVEL);
+    fs.mkdirSync('output', { recursive: true });
+    fs.writeFileSync('output/results.json', JSON.stringify(data, null, 2));
+    console.log(`\nDone. Wrote output/results.json (${data.length} page records).`);
+  } catch (e) {
+    console.error('Fatal:', e);
+    process.exit(1);
+  }
+})();
